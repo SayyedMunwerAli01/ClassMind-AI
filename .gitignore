@@ -1,0 +1,35 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Secret keys — NEVER push secrets
+.env
+
+# Editor
+.vscode/
+
+# OS files
+Thumbs.db
+.DS_Store
+
+# Python temp files
+*.pyc
+__pycache__/
+
+# Supabase temp
+supabase/.temp/
+
+# Logs
+*.log
+
+.env.local
+.env.*.local
+*.pem
+*.key
+coverage/
+.vercel
+.netlify
+.turbo
+.idea/

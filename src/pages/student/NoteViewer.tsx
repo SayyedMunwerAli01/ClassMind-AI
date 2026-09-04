@@ -1,0 +1,527 @@
+import { useEffect, useState, useCallback } from 'react'
+import { Link, useParams } from 'react-router-dom'
+import { useAuth } from '@/hooks/useAuth'
+import { supabase, trackReadingProgress } from '@/lib/supabase'
+import { formatDate } from '@/lib/helpers'
+import { Skeleton } from '@/components/ui/Skeleton'
+import AppHeader from '@/components/AppHeader'
+import MindMapView from '@/components/MindMapView'
+import AITutorChat from '@/components/AITutorChat'
+import type { DailyNote, Subject } from '@/lib/types'
+import {
+  ArrowLeft, FileText, Brain, MessageCircle,
+  Volume2, BookOpen, Lightbulb, ListChecks,
+  Calendar, User, ChevronLeft, ChevronRight, Download,
+} from 'lucide-react'
+import { clsx } from 'clsx'
+import { generatePDF, buildNotesHTML } from '@/lib/pdfUtils'
+
+type Lang = 'en' | 'ur'
+
+export default function NoteViewer() {
+  const { noteId } = useParams<{ noteId: string }>()
+  const { user, profile, loading: authLoading } = useAuth()
+  const verified = !authLoading && !!user
+  const [note, setNote] = useState<DailyNote | null>(null)
+  const [subject, setSubject] = useState<Subject | null>(null)
+  const [teacherName, setTeacherName] = useState('')
+  const [loading, setLoading] = useState(true)
+  const [activeTab, setActiveTab] = useState<'notes' | 'mindmap' | 'quiz' | 'tutor'>('notes')
+  const [isSpeaking, setIsSpeaking] = useState(false)
+  const [lang, setLang] = useState<Lang>('en')
+  const [downloadingPdf, setDownloadingPdf] = useState(false)
+
+  // Quiz state: one question at a time
+  const [quizIndex, setQuizIndex] = useState(0)
+  const [selectedOption, setSelectedOption] = useState<number | null>(null)
+
+  useEffect(() => {
+    if (!verified || !noteId) return
+
+    const loadNote = async () => {
+      setLoading(true)
+      try {
+        const { data: noteData, error } = await supabase
+          .from('daily_notes')
+          .select('*')
+          .eq('id', noteId)
+          .eq('is_published', true)
+          .single()
+
+        if (error) throw error
+        setNote(noteData as DailyNote)
+
+        if (noteData?.subject_id) {
+          const { data: subjectData } = await supabase
+            .from('subjects')
+            .select('*')
+            .eq('id', noteData.subject_id)
+            .single()
+          setSubject(subjectData as Subject)
+        }
+
+        if (noteData?.teacher_id) {
+          const { data: teacherData } = await supabase
+            .from('user_profiles')
+            .select('full_name')
+            .eq('id', noteData.teacher_id)
+            .single()
+          setTeacherName(teacherData?.full_name || '')
+        }
+
+        // Track reading progress only for students
+        if (noteData && user && profile?.role === 'student') {
+          await trackReadingProgress(user.id, noteData.id, noteData.subject_id)
+        }
+      } catch (err) {
+        console.error('Note load error:', err)
+      } finally {
+        setLoading(false)
+      }
+    }
+
+    loadNote()
+  }, [verified, noteId, user])
+
+  const toggleTextToSpeech = useCallback(() => {
+    if (!note?.notes_content) return
+    if (isSpeaking) {
+      window.speechSynthesis.cancel()
+      setIsSpeaking(false)
+      return
+    }
+    const c = note.notes_content
+    const sections = lang === 'en' ? c.sections_en : c.sections
+    const summary = lang === 'en' ? c.summary_en : c.summary
+    const text = `${summary}\n\n${sections?.map(s => `${s.title}\n${s.notes.join('\n')}`).join('\n\n')}`
+    const utterance = new SpeechSynthesisUtterance(text)
+    utterance.lang = lang === 'en' ? 'en-US' : 'ur-PK'
+    utterance.rate = 0.95
+    utterance.onend = () => setIsSpeaking(false)
+    window.speechSynthesis.speak(utterance)
+    setIsSpeaking(true)
+  }, [note, isSpeaking, lang])
+
+  const handleDownloadPDF = useCallback(async () => {
+    if (!note?.notes_content) return
+    setDownloadingPdf(true)
+    try {
+      const c = note.notes_content
+      const isEn = lang === 'en'
+      const html = buildNotesHTML({
+        subjectName: subject?.subject_name || 'Lecture Notes',
+        teacherName,
+        date: formatDate(note.lecture_date),
+        lang,
+        summary: isEn ? c.summary_en : c.summary,
+        sections: isEn ? c.sections_en : c.sections,
+        examples: isEn ? c.examples_en : c.examples,
+        glossary: isEn ? c.glossary_en : c.glossary,
+        quiz: isEn ? note.quiz_content?.quiz_en : note.quiz_content?.quiz,
+      })
+
+      await generatePDF(html, {
+        filename: `${subject?.subject_code || 'notes'}-${isEn ? 'en' : 'ur'}-${note.lecture_date.split('T')[0]}.pdf`,
+        isUrdu: !isEn,
+      })
+    } catch (err) {
+      console.error('PDF generation error:', err)
+    } finally {
+      setDownloadingPdf(false)
+    }
+  }, [note, lang, subject, teacherName])
+
+  if (!verified) return null
+
+  if (loading) {
+    return (
+      <div className="min-h-screen bg-accent-light">
+        <AppHeader portalName={profile?.role === 'teacher' ? 'Teacher Portal' : 'Student Portal'} sticky={false} />
+        <div className="max-w-4xl mx-auto p-4 sm:p-8 space-y-6 animate-fade-in">
+          <Skeleton className="h-8 w-48" />
+          <Skeleton variant="card" className="h-72" />
+        </div>
+      </div>
+    )
+  }
+
+  if (!note) {
+    return (
+      <div className="min-h-screen bg-accent-light">
+        <AppHeader portalName={profile?.role === 'teacher' ? 'Teacher Portal' : 'Student Portal'} sticky={false} />
+        <div className="flex items-center justify-center py-24 px-4">
+          <div className="text-center animate-fade-up">
+            <FileText className="w-20 h-20 text-gray-200 mx-auto mb-4" />
+            <h2 className="text-xl font-bold text-gray-500">Note not found</h2>
+            <Link to="/student/dashboard" className="text-accent-blue font-semibold mt-3 inline-block">Return to dashboard</Link>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  const c = note.notes_content
+  const isEn = lang === 'en'
+  // FIX: nothing downstream had any RTL awareness — every element rendered
+  // through the page's default `ltr`, so Urdu content was left-anchored
+  // and flex rows (bullets, icon+label headers) kept their LTR visual
+  // order regardless of language. `direction` is inherited and both
+  // flexbox and grid respect it for their start/end placement, so setting
+  // `dir` once per tab wrapper below fixes text alignment, bullet
+  // position, and glossary grid order all at once.
+  const dir = isEn ? 'ltr' : 'rtl'
+  const summary = isEn ? c?.summary_en : c?.summary
+  const sections = isEn ? c?.sections_en : c?.sections
+  const glossary = isEn ? c?.glossary_en : c?.glossary
+  const examples = isEn ? c?.examples_en : c?.examples
+  const quiz = isEn ? note.quiz_content?.quiz_en : note.quiz_content?.quiz
+  const shortQA = isEn ? note.quiz_content?.shortQA_en : note.quiz_content?.shortQA
+
+  const currentQ = quiz?.[quizIndex]
+  const totalQuiz = quiz?.length || 0
+
+  const handleOptionSelect = (optIndex: number) => {
+    if (selectedOption !== null) return // already answered
+    setSelectedOption(optIndex)
+  }
+
+  const nextQuestion = () => {
+    if (quizIndex < totalQuiz - 1) {
+      setQuizIndex(prev => prev + 1)
+      setSelectedOption(null)
+    }
+  }
+
+  const prevQuestion = () => {
+    if (quizIndex > 0) {
+      setQuizIndex(prev => prev - 1)
+      setSelectedOption(null)
+    }
+  }
+
+  const tabs = [
+    { key: 'notes' as const, label: 'Notes', icon: <FileText className="w-4 h-4" /> },
+    { key: 'mindmap' as const, label: 'Mind Map', icon: <Brain className="w-4 h-4" /> },
+    { key: 'quiz' as const, label: 'Quiz', icon: <ListChecks className="w-4 h-4" /> },
+    { key: 'tutor' as const, label: 'AI Tutor', icon: <MessageCircle className="w-4 h-4" /> },
+  ]
+
+  return (
+    <div className="min-h-screen bg-accent-light">
+      {/* Main app header (consistent with every other page) */}
+      <AppHeader portalName={profile?.role === 'teacher' ? 'Teacher Portal' : 'Student Portal'} sticky={false} />
+
+      {/* Note toolbar — soft band, distinct from the navy header above */}
+      <div className="sub-header px-4 sm:px-6 py-4">
+        <div className="max-w-4xl mx-auto flex items-center justify-between gap-3">
+          <Link to={profile?.role === 'teacher' ? '/teacher/dashboard' : `/student/subject/${note.subject_id}`} className="inline-flex items-center gap-2 text-accent-blue hover:text-navy transition-colors text-sm font-semibold">
+            <ArrowLeft className="w-4 h-4" />
+            {profile?.role === 'teacher' ? 'Dashboard' : subject?.subject_name || 'Back'}
+          </Link>
+          <div className="flex items-center gap-2 sm:gap-3">
+            <button
+              onClick={handleDownloadPDF}
+              disabled={downloadingPdf}
+              className={clsx(
+                'inline-flex items-center gap-2 px-3.5 py-1.5 rounded-xl text-xs font-semibold transition-all bg-white border shadow-sm',
+                downloadingPdf
+                  ? 'border-gray-100 text-gray-300 cursor-not-allowed'
+                  : 'border-navy-100 text-navy hover:border-accent-blue/50 hover:text-accent-blue',
+              )}
+            >
+              {downloadingPdf ? (
+                <><span className="w-3.5 h-3.5 border-2 border-gray-300 border-t-transparent rounded-full animate-spin" /> PDF...</>
+              ) : (
+                <><Download className="w-4 h-4" /> <span className="hidden sm:inline">PDF</span></>
+              )}
+            </button>
+            <button
+              onClick={toggleTextToSpeech}
+              className={clsx(
+                'inline-flex items-center gap-2 px-3.5 py-1.5 rounded-xl text-xs font-semibold transition-all border shadow-sm',
+                isSpeaking
+                  ? 'border-accent-blue/50 text-accent-blue bg-accent-blue/10'
+                  : 'border-navy-100 text-navy bg-white hover:border-accent-blue/50 hover:text-accent-blue',
+              )}
+            >
+              <Volume2 className="w-4 h-4" />
+              <span className="hidden sm:inline">{isSpeaking ? 'Stop' : 'Listen'}</span>
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {/* Meta Strip */}
+      <div className="bg-white border-b border-gray-100 px-4 sm:px-6 py-3">
+        <div className="max-w-4xl mx-auto flex items-center gap-5 text-xs text-gray-400 overflow-x-auto">
+          <span className="inline-flex items-center gap-1.5 shrink-0">
+            <Calendar className="w-3.5 h-3.5" />
+            {formatDate(note.lecture_date)}
+          </span>
+          {subject && (
+            <span className="inline-flex items-center gap-1.5 shrink-0">
+              <BookOpen className="w-3.5 h-3.5" />
+              {subject.subject_name}
+            </span>
+          )}
+          {teacherName && (
+            <span className="inline-flex items-center gap-1.5 shrink-0">
+              <User className="w-3.5 h-3.5" />
+              {teacherName}
+            </span>
+          )}
+        </div>
+      </div>
+
+      {/* Content Area */}
+      <div className="max-w-4xl mx-auto px-3 sm:px-6 py-5 overflow-hidden">
+        {/* Tabs Row — kept ltr regardless of content language; it's fixed UI chrome, not translated content */}
+        <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between mb-5 gap-3">
+          <div className="flex gap-1.5 overflow-x-auto w-full sm:w-auto pb-1">
+            {tabs.map(tab => (
+              <button
+                key={tab.key}
+                onClick={() => { setActiveTab(tab.key); setQuizIndex(0); setSelectedOption(null) }}
+                className={clsx(
+                  'px-3 py-2 rounded-xl text-xs font-semibold transition-all flex items-center gap-1.5 shrink-0 whitespace-nowrap',
+                  activeTab === tab.key
+                    ? 'bg-navy text-white shadow-md shadow-navy/10'
+                    : 'bg-white text-gray-500 border border-gray-100 hover:border-navy/20 hover:text-navy',
+                )}
+              >
+                {tab.icon}
+                {tab.label}
+              </button>
+            ))}
+          </div>
+
+          {activeTab !== 'mindmap' && activeTab !== 'tutor' && (
+            <div className="flex bg-white rounded-xl border border-gray-100 overflow-hidden shadow-sm">
+              <button onClick={() => setLang('en')} className={clsx('px-3.5 py-1.5 text-xs font-bold transition-all', isEn ? 'bg-navy text-white' : 'text-gray-400 hover:text-navy')}>EN</button>
+              <button onClick={() => setLang('ur')} className={clsx('px-3.5 py-1.5 text-xs font-bold transition-all', !isEn ? 'bg-navy text-white' : 'text-gray-400 hover:text-navy')}>اردو</button>
+            </div>
+          )}
+        </div>
+
+        {/* NOTES TAB */}
+        {activeTab === 'notes' && (
+          <div className="space-y-4 animate-fade-in" dir={dir}>
+            {summary && (
+              <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-5">
+                <div className="flex items-center gap-2 mb-3">
+                  <Lightbulb className="w-4 h-4 text-amber-400" />
+                  <span className="text-[11px] font-bold text-gray-400 uppercase tracking-wider">{isEn ? 'Overview' : 'خلاصہ'}</span>
+                </div>
+                <p className="text-sm text-gray-700 leading-relaxed break-words">{summary}</p>
+              </div>
+            )}
+
+            {sections?.map((section, i) => (
+              <div key={i} className="bg-white rounded-2xl border border-gray-100 shadow-sm p-4 sm:p-5 overflow-hidden">
+                <h3 className="font-bold text-navy text-[15px] mb-3 break-words">{section.title}</h3>
+                <div className="space-y-2.5">
+                  {section.notes?.map((t, ni) => (
+                    <div key={ni} className="flex items-start gap-2.5 min-w-0">
+                      <span className="w-1.5 h-1.5 rounded-full bg-accent-blue mt-2 shrink-0" />
+                      <p className="text-sm text-gray-600 leading-relaxed break-words min-w-0">{t}</p>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ))}
+
+            {examples && examples.length > 0 && (
+              <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-4 sm:p-5 overflow-hidden">
+                <div className="flex items-center gap-2 mb-3">
+                  <Brain className="w-4 h-4 text-purple-400" />
+                  <span className="text-[11px] font-bold text-gray-400 uppercase tracking-wider">{isEn ? 'Examples & Analogies' : 'مثالیں'}</span>
+                </div>
+                <div className="space-y-2.5">
+                  {examples.map((ex, i) => (
+                    <div key={i} className="bg-purple-50/40 rounded-xl p-3.5 border border-purple-100/40">
+                      <h4 className="font-semibold text-navy text-sm break-words">{ex.topic}</h4>
+                      <p className="text-sm text-gray-600 mt-1 break-words">{ex.example}</p>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Glossary — full text, responsive grid */}
+            {glossary && glossary.length > 0 && (
+              <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-5">
+                <div className="flex items-center gap-2 mb-3">
+                  <BookOpen className="w-4 h-4 text-emerald-400" />
+                  <span className="text-[11px] font-bold text-gray-400 uppercase tracking-wider">{isEn ? 'Key Terms' : 'اصطلاحات'}</span>
+                </div>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                  {glossary.map((item, i) => (
+                    <div key={i} className="bg-gray-50/50 rounded-xl p-3.5 border border-gray-100/50">
+                      <span className="font-bold text-navy text-sm block break-words">{item.term}</span>
+                      <span className="text-xs text-gray-500 mt-1 leading-relaxed block break-words">{item.definition}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* MINDMAP TAB */}
+        {activeTab === 'mindmap' && c?.mindmap && (
+          <div className="animate-fade-in bg-white rounded-2xl shadow-sm border border-gray-100 p-6">
+            <MindMapView mindmap={c.mindmap} className="h-[600px]" />
+          </div>
+        )}
+
+        {/* QUIZ TAB — Interactive one-by-one */}
+        {activeTab === 'quiz' && (
+          <div className="animate-fade-in" dir={dir}>
+            {totalQuiz > 0 && currentQ ? (
+              <>
+                {/* Progress */}
+                <div className="flex items-center justify-between mb-4">
+                  <span className="text-xs font-bold text-gray-400">{quizIndex + 1} / {totalQuiz}</span>
+                  <div className="flex-1 mx-4 h-1.5 bg-gray-100 rounded-full overflow-hidden">
+                    <div className="h-full bg-accent-blue rounded-full transition-all duration-300" style={{ width: `${((quizIndex + 1) / totalQuiz) * 100}%` }} />
+                  </div>
+                </div>
+
+                {/* Question Card */}
+                <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-4 sm:p-6 overflow-hidden">
+                  <p className="font-bold text-navy text-base mb-5 leading-snug break-words">{currentQ.question}</p>
+
+                  <div className="space-y-2.5">
+                    {currentQ.options?.map((option, oi) => {
+                      const isCorrect = oi === currentQ.correctIndex
+                      const isSelected = selectedOption === oi
+                      const answered = selectedOption !== null
+
+                      let optionStyle = 'border-gray-100 bg-gray-50/50 text-gray-700 hover:bg-gray-100'
+                      if (answered) {
+                        if (isCorrect) {
+                          optionStyle = 'border-emerald-200 bg-emerald-50 text-emerald-800'
+                        } else if (isSelected && !isCorrect) {
+                          optionStyle = 'border-red-200 bg-red-50 text-red-700'
+                        } else {
+                          optionStyle = 'border-gray-100 bg-white text-gray-400'
+                        }
+                      }
+
+                      return (
+                        <button
+                          key={oi}
+                          onClick={() => handleOptionSelect(oi)}
+                          disabled={answered}
+                          className={clsx(
+                            // FIX: was hardcoded `text-left`, which forced
+                            // left alignment even for Urdu options.
+                            'w-full px-4 py-3 rounded-xl border text-sm font-medium transition-all',
+                            isEn ? 'text-left' : 'text-right',
+                            optionStyle,
+                            !answered && 'cursor-pointer active:scale-[0.99]',
+                            answered && 'cursor-default',
+                          )}
+                        >
+                          {/*
+                            FIX: this row is deliberately kept dir="ltr" so
+                            the A/B/C/D badge always stays on the same
+                            (left) side as a fixed marker, matching the
+                            app's existing Urdu quiz UI. The option text
+                            itself gets dir={dir} re-applied so it still
+                            reads and right-aligns correctly in Urdu —
+                            without this override the row would inherit
+                            rtl from the wrapper above and flip the badge
+                            to the right instead.
+                          */}
+                          <span className="inline-flex items-center gap-2.5 w-full" dir="ltr">
+                            <span className={clsx(
+                              'w-6 h-6 rounded-full flex items-center justify-center text-xs font-bold shrink-0',
+                              answered && isCorrect ? 'bg-emerald-200 text-emerald-700' :
+                              answered && isSelected && !isCorrect ? 'bg-red-200 text-red-600' :
+                              'bg-gray-100 text-gray-500',
+                            )}>
+                              {String.fromCharCode(65 + oi)}
+                            </span>
+                            <span className={clsx('break-words min-w-0 flex-1', !isEn && 'text-right')} dir={dir}>{option}</span>
+                          </span>
+
+                          {answered && isCorrect && (
+                            <span className={clsx('text-emerald-600 text-xs font-bold mt-0.5', isEn ? 'ml-auto float-right' : 'mr-auto float-left')}>✓ {isEn ? 'Correct' : 'درست'}</span>
+                          )}
+                          {answered && isSelected && !isCorrect && (
+                            <span className={clsx('text-red-500 text-xs font-bold mt-0.5', isEn ? 'ml-auto float-right' : 'mr-auto float-left')}>✗ {isEn ? 'Wrong' : 'غلط'}</span>
+                          )}
+                        </button>
+                      )
+                    })}
+                  </div>
+
+                  {/* Explanation after answer */}
+                  {selectedOption !== null && currentQ.explanation && (
+                    <div className="mt-4 bg-amber-50/50 rounded-xl p-3.5 border border-amber-100/50 animate-fade-in">
+                      <p className={clsx('text-xs text-gray-600', !isEn && 'text-right')} dir={dir}>
+                        <span className="font-bold text-amber-600">{isEn ? 'Why? ' : 'وجہ: '}</span>
+                        {currentQ.explanation}
+                      </p>
+                    </div>
+                  )}
+                </div>
+
+                {/* Navigation — kept ltr; Prev/Next are fixed nav controls, not translated content */}
+                <div className="flex items-center justify-between mt-4">
+                  <button
+                    onClick={prevQuestion}
+                    disabled={quizIndex === 0}
+                    className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl text-sm font-semibold text-gray-500 bg-white border border-gray-100 hover:border-navy/20 disabled:opacity-30 transition-all"
+                  >
+                    <ChevronLeft className="w-4 h-4" />
+                    Prev
+                  </button>
+                  <button
+                    onClick={nextQuestion}
+                    disabled={quizIndex === totalQuiz - 1}
+                    className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl text-sm font-semibold text-white bg-navy hover:bg-navy-light disabled:opacity-30 transition-all"
+                  >
+                    Next
+                    <ChevronRight className="w-4 h-4" />
+                  </button>
+                </div>
+              </>
+            ) : (
+              <div className="empty-state py-12">
+                <ListChecks className="w-14 h-14 text-gray-200 mx-auto mb-3" />
+                <h3 className="text-base font-semibold text-gray-400">No quiz questions available</h3>
+              </div>
+            )}
+
+            {/* Short Q&A — after all quiz questions */}
+            {shortQA && shortQA.length > 0 && (
+              <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-5 mt-5">
+                <div className="flex items-center gap-2 mb-3">
+                  <MessageCircle className="w-4 h-4 text-purple-400" />
+                  <span className="text-[11px] font-bold text-gray-400 uppercase tracking-wider">{isEn ? 'Short Answers' : 'مختصر جوابات'}</span>
+                </div>
+                <div className="space-y-2.5">
+                  {shortQA.map((qa, i) => (
+                    <div key={i} className="bg-gray-50/50 rounded-xl p-3.5 border border-gray-100/50">
+                      <p className="font-semibold text-navy text-sm mb-1">{i + 1}. {qa.question}</p>
+                      <p className="text-sm text-gray-600">{qa.answer}</p>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* AI TUTOR TAB */}
+        {activeTab === 'tutor' && (
+          <div className="animate-fade-in">
+            <AITutorChat noteId={note.id} notesContent={c} className="max-w-3xl mx-auto" />
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
