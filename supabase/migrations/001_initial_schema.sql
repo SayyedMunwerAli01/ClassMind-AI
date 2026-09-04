@@ -1,5 +1,4 @@
 -- ClassMind AI Database Schema
--- University of Sindh, Jamshoro
 
 -- Create user_profiles table
 CREATE TABLE IF NOT EXISTS public.user_profiles (

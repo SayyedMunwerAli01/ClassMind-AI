@@ -57,7 +57,7 @@ export default function Landing() {
             <Logo size={40} glow />
             <div className="min-w-0">
               <span className="block font-bold text-white text-sm tracking-tight truncate">ClassMind AI</span>
-              <p className="hidden sm:block text-[10px] text-white/30 font-medium -mt-0.5 tracking-widest uppercase">University of Sindh</p>
+              <p className="hidden sm:block text-[10px] text-white/30 font-medium -mt-0.5 tracking-widest uppercase"></p>
             </div>
           </Link>
 
@@ -563,7 +563,7 @@ export default function Landing() {
                 <Logo size={40} glow />
                 <div>
                   <span className="font-bold text-white text-sm">ClassMind AI</span>
-                  <p className="text-[10px] text-white/25 -mt-0.5 tracking-widest uppercase">University of Sindh</p>
+                  <p className="text-[10px] text-white/25 -mt-0.5 tracking-widest uppercase"></p>
                 </div>
               </div>
               <p className="text-white/30 text-sm leading-relaxed max-w-sm">
@@ -589,7 +589,7 @@ export default function Landing() {
             </div>
           </div>
           <div className="border-t border-white/[0.04] pt-8 flex flex-col sm:flex-row items-center justify-between gap-4">
-            <p className="text-white/20 text-xs text-center sm:text-left">© 2026 ClassMind AI &mdash; Institute of Information Technology & Computer Science, University of Sindh, Jamshoro</p>
+            <p className="text-white/20 text-xs text-center sm:text-left">© 2026 ClassMind AI &mdash; </p>
             <div className="flex items-center gap-4 shrink-0">
               <span className="text-white/20 text-xs flex items-center gap-1.5">
                 <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />

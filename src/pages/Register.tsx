@@ -104,7 +104,7 @@ export default function Register() {
           {/* Heading */}
           <div className="text-center mb-8 animate-fade-up">
             <h1 className="text-3xl font-bold text-white tracking-tight">Create your account</h1>
-            <p className="text-white/50 mt-2 text-sm">Join ClassMind AI — University of Sindh</p>
+            <p className="text-white/50 mt-2 text-sm">Join ClassMind AI </p>
           </div>
 
         {/* Form */}
