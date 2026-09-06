@@ -1,0 +1,632 @@
+// supabase/functions/process-audio-chunk/index.ts
+/**
+ * Process Audio Chunk - Transcribes a chunk of audio using Groq Whisper API
+ */
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts"
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.0"
+
+const GROQ_API_KEY = Deno.env.get("GROQ_API_KEY") || ""
+const SUPABASE_URL = Deno.env.get("SUPABASE_URL") || ""
+const SUPABASE_ANON_KEY = Deno.env.get("SUPABASE_ANON_KEY") || ""
+const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || ""
+
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
+}
+
+serve(async (req: Request) => {
+  // Handle CORS preflight
+  if (req.method === "OPTIONS") {
+    return new Response("ok", { headers: corsHeaders })
+  }
+
+  try {
+    const body = await req.json()
+    const {
+      sessionId,
+      teacherId,
+      subjectId,
+      audioData,
+      mimeType,
+      chunkIndex,
+      isFinal = false,
+    } = body
+
+    if (!audioData || !sessionId) {
+      throw new Error("Missing required fields: audioData, sessionId")
+    }
+
+    // Create Supabase admin client
+    const supabaseAdmin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+
+    // Convert base64 to binary
+    const binaryData = Uint8Array.from(atob(audioData), c => c.charCodeAt(0))
+    const blob = new Blob([binaryData], { type: mimeType || "audio/webm" })
+
+    // Create FormData for Groq API
+    const formData = new FormData()
+    formData.append("file", blob, `chunk_${chunkIndex}.${mimeType?.includes("mp4") ? "mp4" : mimeType?.includes("ogg") ? "ogg" : "webm"}`)
+    formData.append("model", "whisper-large-v3")
+    formData.append("language", "ur")
+    formData.append("response_format", "json")
+    formData.append("temperature", "0.0")
+
+    // Call Groq Whisper API
+    const groqResponse = await fetch(
+      "https://api.groq.com/openai/v1/audio/transcriptions",
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${GROQ_API_KEY}`,
+        },
+        body: formData,
+      }
+    )
+
+    if (!groqResponse.ok) {
+      const errorText = await groqResponse.text()
+      console.error("Groq API error:", groqResponse.status, errorText)
+      throw new Error(`Groq API error: ${groqResponse.status} - ${errorText.substring(0, 200)}`)
+    }
+
+    const groqResult = await groqResponse.json()
+    const transcript = groqResult.text?.trim() || ""
+
+    // Store in session_transcripts table
+    if (transcript) {
+      // Check if session exists
+      const { data: existingSession } = await supabaseAdmin
+        .from("session_transcripts")
+        .select("*")
+        .eq("session_id", sessionId)
+        .single()
+
+      if (existingSession) {
+        // Update existing session
+        await supabaseAdmin
+          .from("session_transcripts")
+          .update({
+            accumulated_text: existingSession.accumulated_text + " " + transcript,
+            chunk_count: chunkIndex + 1,
+            updated_at: new Date().toISOString(),
+          })
+          .eq("session_id", sessionId)
+      } else {
+        // Create new session record
+        await supabaseAdmin
+          .from("session_transcripts")
+          .insert({
+            session_id: sessionId,
+            teacher_id: teacherId,
+            subject_id: subjectId,
+            accumulated_text: transcript,
+            chunk_count: 1,
+          })
+
+        // Track active session
+        await supabaseAdmin
+          .from("active_sessions")
+          .insert({
+            session_id: sessionId,
+            teacher_id: teacherId,
+            subject_id: subjectId,
+          })
+      }
+    }
+
+    return new Response(
+      JSON.stringify({
+        success: true,
+        transcript,
+        chunkIndex: chunkIndex + 1,
+        isFinal,
+      }),
+      {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      }
+    )
+  } catch (err: any) {
+    console.error("Error in process-audio-chunk:", err)
+    return new Response(
+      JSON.stringify({ success: false, error: err.message }),
+      {
+        status: 400,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      }
+    )
+  }
+})
+
+// ========================
+// supabase/functions/process-full-transcript/index.ts
+/**
+ * Process Full Transcript - Generates notes, quizzes, and study materials using Google Gemini
+ */
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts"
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.0"
+
+const SUPABASE_URL = Deno.env.get("SUPABASE_URL") || ""
+const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || ""
+
+// Gemini API keys (support up to 10 for rotation)
+const GEMINI_API_KEYS = [
+  Deno.env.get("GEMINI_API_KEY_1") || "",
+  Deno.env.get("GEMINI_API_KEY_2") || "",
+  Deno.env.get("GEMINI_API_KEY_3") || "",
+  Deno.env.get("GEMINI_API_KEY_4") || "",
+  Deno.env.get("GEMINI_API_KEY_5") || "",
+  Deno.env.get("GEMINI_API_KEY_6") || "",
+  Deno.env.get("GEMINI_API_KEY_7") || "",
+  Deno.env.get("GEMINI_API_KEY_8") || "",
+  Deno.env.get("GEMINI_API_KEY_9") || "",
+  Deno.env.get("GEMINI_API_KEY_10") || "",
+].filter(key => key.length > 0)
+
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
+}
+
+// Helper: Call Gemini with key rotation
+async function callGeminiWithRotation(
+  prompt: string,
+  systemPrompt: string,
+  maxOutputTokens: number = 8000,
+  temperature: number = 0.3
+): Promise<any> {
+  for (const apiKey of GEMINI_API_KEYS) {
+    try {
+      const response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            system_instruction: {
+              parts: [{ text: systemPrompt }],
+            },
+            contents: [
+              {
+                role: "user",
+                parts: [{ text: prompt }],
+              },
+            ],
+            generationConfig: {
+              temperature,
+              maxOutputTokens,
+              topP: 0.9,
+              topK: 40,
+            },
+          }),
+        }
+      )
+
+      if (response.status === 429 || response.status === 404) {
+        console.log(`Key rate limited or invalid (${response.status}), trying next key...`)
+        continue
+      }
+
+      if (!response.ok) {
+        const errorText = await response.text()
+        throw new Error(`Gemini API error: ${response.status} - ${errorText.substring(0, 300)}`)
+      }
+
+      const data = await response.json()
+      const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || ""
+      return text
+    } catch (err) {
+      console.error("Gemini call error:", err)
+      continue
+    }
+  }
+
+  throw new Error("All Gemini API keys failed")
+}
+
+// Helper: Parse JSON from Gemini response
+function parseGeminiJSON(text: string): any {
+  // Try to find JSON in the response
+  const jsonMatch = text.match(/\{[\s\S]*\}/)
+  if (jsonMatch) {
+    try {
+      return JSON.parse(jsonMatch[0])
+    } catch {
+      // Try to extract from code block
+      const codeMatch = text.match(/```json\n([\s\S]*?)```/)
+      if (codeMatch) {
+        return JSON.parse(codeMatch[1])
+      }
+    }
+  }
+  throw new Error("Failed to parse JSON from Gemini response")
+}
+
+serve(async (req: Request) => {
+  if (req.method === "OPTIONS") {
+    return new Response("ok", { headers: corsHeaders })
+  }
+
+  try {
+    const body = await req.json()
+    const { sessionId, subjectId, teacherId } = body
+
+    if (!sessionId || !subjectId || !teacherId) {
+      throw new Error("Missing required fields: sessionId, subjectId, teacherId")
+    }
+
+    const supabaseAdmin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+
+    // Get accumulated transcript
+    const { data: sessionData, error: sessionError } = await supabaseAdmin
+      .from("session_transcripts")
+      .select("*")
+      .eq("session_id", sessionId)
+      .single()
+
+    if (sessionError || !sessionData) {
+      throw new Error("Session transcript not found")
+    }
+
+    const fullTranscript = sessionData.accumulated_text
+    const chunkCount = sessionData.chunk_count
+
+    // Estimate lecture duration
+    const estimatedMinutes = Math.max(5, Math.round(fullTranscript.length / 150))
+
+    // Determine token budgets based on duration
+    let notesTokens = 4000
+    let studyTokens = 6000
+    if (estimatedMinutes > 60) {
+      notesTokens = 32000
+      studyTokens = 9000
+    } else if (estimatedMinutes > 45) {
+      notesTokens = 24000
+      studyTokens = 8000
+    } else if (estimatedMinutes > 30) {
+      notesTokens = 16000
+      studyTokens = 7000
+    }
+
+    // System prompts
+    const notesSystemPrompt = `You are an expert educational content creator for Pakistani universities. 
+You will receive a lecture transcript in Urdu (with some English technical terms).
+Your task is to create organized, bilingual (Urdu and English) study notes.
+
+CRITICAL REQUIREMENTS:
+1. Generate notes in BOTH Urdu and English
+2. Organize into clear sections with individual notes
+3. Include a summary in both languages
+4. Extract a glossary of key terms (bilingual)
+5. Create a mind map structure
+6. All content must be accurate to the transcript
+
+Respond in JSON format with this exact structure:
+{
+  "summary": "Urdu summary of the entire lecture",
+  "summary_en": "English summary of the entire lecture",
+  "sections": [{"title": "Section title in Urdu", "notes": ["note in Urdu"]}],
+  "sections_en": [{"title": "Section title in English", "notes": ["note in English"]}],
+  "notes": ["individual Urdu notes"],
+  "notes_en": ["individual English notes"],
+  "glossary": [{"term": "Urdu term", "definition": "Urdu definition"}],
+  "glossary_en": [{"term": "English term", "definition": "English definition"}],
+  "todos": [{"task": "task description", "deadline": "suggested deadline", "type": "assignment/quiz/reading/custom"}],
+  "mindmap": {
+    "central": "Main topic",
+    "branches": [{"topic": "Sub-topic", "subtopics": ["detail 1", "detail 2"]}]
+  }
+}`
+
+    const studySystemPrompt = `You are an expert quiz creator for Pakistani universities.
+Based on the lecture transcript provided, generate:
+1. A 10-question multiple-choice quiz (bilingual)
+2. Short answer Q&A pairs (bilingual)
+3. To-do items for students
+
+Respond in JSON format with this exact structure:
+{
+  "quiz": [{"question": "Urdu question", "options": ["A", "B", "C", "D"], "correctIndex": 0, "explanation": "Urdu explanation"}],
+  "quiz_en": [{"question": "English question", "options": ["A", "B", "C", "D"], "correctIndex": 0, "explanation": "English explanation"}],
+  "shortQA": [{"question": "Urdu question", "answer": "Urdu answer"}],
+  "shortQA_en": [{"question": "English question", "answer": "English answer"}],
+  "todos": [{"task": "task", "deadline": "date", "type": "type"}]
+}`
+
+    // Generate notes and study materials in parallel
+    const [notesText, studyText] = await Promise.all([
+      callGeminiWithRotation(fullTranscript, notesSystemPrompt, notesTokens, 0.3),
+      callGeminiWithRotation(fullTranscript, studySystemPrompt, studyTokens, 0.3),
+    ])
+
+    const notesContent = parseGeminiJSON(notesText)
+    const quizContent = parseGeminiJSON(studyText)
+
+    // Clean up session data
+    await supabaseAdmin
+      .from("session_transcripts")
+      .delete()
+      .eq("session_id", sessionId)
+
+    await supabaseAdmin
+      .from("active_sessions")
+      .delete()
+      .eq("session_id", sessionId)
+
+    return new Response(
+      JSON.stringify({
+        success: true,
+        notesContent,
+        quizContent,
+        estimatedMinutes,
+        chunkCount,
+      }),
+      {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      }
+    )
+  } catch (err: any) {
+    console.error("Error in process-full-transcript:", err)
+    return new Response(
+      JSON.stringify({ success: false, error: err.message }),
+      {
+        status: 400,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      }
+    )
+  }
+})
+
+// ========================
+// supabase/functions/ai-tutor/index.ts
+/**
+ * AI Tutor - Answers questions grounded in specific lecture notes
+ */
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts"
+
+const GEMINI_API_KEYS = [
+  Deno.env.get("GEMINI_API_KEY_1") || "",
+  Deno.env.get("GEMINI_API_KEY_2") || "",
+  Deno.env.get("GEMINI_API_KEY_3") || "",
+].filter(key => key.length > 0)
+
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
+}
+
+const FALLBACK_MESSAGES = {
+  en: "This topic was not covered in today's lecture. Please refer to your textbook or ask your teacher.",
+  ur: "یہ موضوع آج کے لیکچر میں شامل نہیں تھا۔ براہ کرم اپنی نصابی کتاب دیکھیں یا اپنے استاد سے پوچھیں۔",
+  romanUrdu: "Yeh topic aaj ke lecture mein shamil nahi tha. Barah-e-karam apni nisabi kitab dekhein ya apne ustaad se poochhein.",
+}
+
+serve(async (req: Request) => {
+  if (req.method === "OPTIONS") {
+    return new Response("ok", { headers: corsHeaders })
+  }
+
+  try {
+    const body = await req.json()
+    const { question, noteId, notesContent } = body
+
+    if (!question || !notesContent) {
+      throw new Error("Missing required fields: question, notesContent")
+    }
+
+    // Build system prompt with grounding
+    const systemPrompt = `You are an AI Tutor for a Pakistani university student.
+You can ONLY answer questions based on the lecture notes provided below.
+CRITICAL RULES:
+1. ONLY use information from the provided lecture notes
+2. If the question is NOT about topics in the notes, respond with the fallback message
+3. Detect the language of the question:
+   - If Urdu script (uses Arabic characters), respond in Urdu script
+   - If Roman Urdu (Latin characters but Urdu words), respond in Roman Urdu
+   - If English, respond in English
+4. Be concise and educational
+5. If the student asks about something partially covered, answer what's in the notes and note it's limited
+
+LECTURE NOTES CONTENT:
+${JSON.stringify(notesContent, null, 2)}
+
+FALLBACK MESSAGES:
+- English: "${FALLBACK_MESSAGES.en}"
+- Urdu: "${FALLBACK_MESSAGES.ur}"
+- Roman Urdu: "${FALLBACK_MESSAGES.romanUrdu}"`
+
+    // Detect language
+    const hasUrduScript = /[\u0600-\u06FF]/.test(question)
+    const romanUrduWords = ['kya', 'kaise', 'kyun', 'kab', 'kahan', 'mein', 'hai', 'hain', 'nahi', 'aur', 'ya', 'wo', 'yeh', 'mera', 'apka', 'hum', 'tum']
+    const words = question.toLowerCase().split(/\s+/)
+    const romanUrduCount = words.filter(w => romanUrduWords.includes(w)).length
+    const detectedLanguage = hasUrduScript ? 'urdu' : romanUrduCount > 0 ? 'roman-urdu' : 'english'
+
+    let answer = FALLBACK_MESSAGES[detectedLanguage as keyof typeof FALLBACK_MESSAGES] || FALLBACK_MESSAGES.en
+
+    for (const apiKey of GEMINI_API_KEYS) {
+      try {
+        const response = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              system_instruction: {
+                parts: [{ text: systemPrompt }],
+              },
+              contents: [
+                {
+                  role: "user",
+                  parts: [{ text: question }],
+                },
+              ],
+              generationConfig: {
+                temperature: 0.3,
+                maxOutputTokens: 2048,
+                topP: 0.9,
+              },
+            }),
+          }
+        )
+
+        if (response.status === 429 || response.status === 404) {
+          continue
+        }
+
+        if (!response.ok) {
+          const errorText = await response.text()
+          console.error("Gemini error:", response.status, errorText.substring(0, 200))
+          continue
+        }
+
+        const data = await response.json()
+        const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || ""
+        if (text) {
+          answer = text
+        }
+        break
+      } catch (err) {
+        console.error("Gemini call error:", err)
+        continue
+      }
+    }
+
+    return new Response(
+      JSON.stringify({
+        success: true,
+        answer,
+        language: detectedLanguage,
+      }),
+      {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      }
+    )
+  } catch (err: any) {
+    console.error("Error in ai-tutor:", err)
+    return new Response(
+      JSON.stringify({
+        success: false,
+        error: err.message,
+        answer: FALLBACK_MESSAGES.en,
+        language: 'english',
+      }),
+      {
+        status: 400,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      }
+    )
+  }
+})
+
+// ========================
+// supabase/functions/generate-question-paper/index.ts
+/**
+ * Generate Question Paper - Creates exam papers from lecture notes
+ */
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts"
+
+const GEMINI_API_KEYS = [
+  Deno.env.get("GEMINI_API_KEY_1") || "",
+  Deno.env.get("GEMINI_API_KEY_2") || "",
+  Deno.env.get("GEMINI_API_KEY_3") || "",
+].filter(key => key.length > 0)
+
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
+}
+
+serve(async (req: Request) => {
+  if (req.method === "OPTIONS") {
+    return new Response("ok", { headers: corsHeaders })
+  }
+
+  try {
+    const body = await req.json()
+    const { notesContent, subjectName, composition } = body
+
+    if (!notesContent) {
+      throw new Error("Missing required field: notesContent")
+    }
+
+    const systemPrompt = `You are an exam paper creator for Pakistani universities.
+Based on the lecture notes provided, create a comprehensive question paper.
+
+Composition: ${composition || "5 MCQs (2 marks each), 3 short-answer (5 marks each), 2 long-answer (10 marks each)"}
+Subject: ${subjectName || "Subject"}
+
+Respond in JSON format:
+{
+  "mcqs": [{"question": "Q", "options": ["A", "B", "C", "D"], "correctIndex": 0, "marks": 2, "cognitiveLevel": "knowledge"}],
+  "shortAnswers": [{"question": "Q", "answer": "A", "marks": 5, "cognitiveLevel": "comprehension"}],
+  "longAnswers": [{"question": "Q", "answer": "A", "marks": 10, "cognitiveLevel": "analysis"}],
+  "totalMarks": 50,
+  "durationMinutes": 90
+}`
+
+    let result: any = null
+
+    for (const apiKey of GEMINI_API_KEYS) {
+      try {
+        const response = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              system_instruction: {
+                parts: [{ text: systemPrompt }],
+              },
+              contents: [
+                {
+                  role: "user",
+                  parts: [{ text: JSON.stringify(notesContent) }],
+                },
+              ],
+              generationConfig: {
+                temperature: 0.4,
+                maxOutputTokens: 6000,
+              },
+            }),
+          }
+        )
+
+        if (response.status === 429 || response.status === 404) continue
+
+        if (!response.ok) continue
+
+        const data = await response.json()
+        const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || ""
+        const jsonMatch = text.match(/\{[\s\S]*\}/)
+        if (jsonMatch) {
+          result = JSON.parse(jsonMatch[0])
+          break
+        }
+      } catch (err) {
+        continue
+      }
+    }
+
+    return new Response(
+      JSON.stringify({ success: true, questionPaper: result }),
+      {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      }
+    )
+  } catch (err: any) {
+    return new Response(
+      JSON.stringify({ success: false, error: err.message }),
+      {
+        status: 400,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      }
+    )
+  }
+})

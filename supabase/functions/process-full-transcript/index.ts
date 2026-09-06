@@ -22,11 +22,31 @@ const GEMINI_API_KEYS = [
   Deno.env.get("GEMINI_API_KEY_10") || "",
 ].filter(key => key.length > 0)
 
+// Gemini 3.5 Flash's hard output cap (input cap is 1M, irrelevant here).
+const MODEL_MAX_OUTPUT_TOKENS = 65536
+
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "POST, OPTIONS",
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
 }
+
+interface GeminiCallResult {
+  text: string
+  finishReason: string | undefined
+  truncated: boolean
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+// HTTP statuses worth retrying: transient overload / rate-limit / upstream
+// hiccups. Gemini's 503 "high demand" error falls in here — it's temporary
+// and usually clears within a few seconds, so failing instantly (especially
+// with only one API key configured) throws away requests that would have
+// succeeded a moment later.
+const RETRYABLE_STATUS_CODES = new Set([429, 500, 502, 503, 504])
 
 // Helper: Call Gemini with key rotation
 async function callGeminiWithRotation(
@@ -34,72 +54,335 @@ async function callGeminiWithRotation(
   systemPrompt: string,
   maxOutputTokens: number = 8000,
   temperature: number = 0.3
-): Promise<any> {
+): Promise<GeminiCallResult> {
   const errors: string[] = []
 
   for (const apiKey of GEMINI_API_KEYS) {
     const keyPrefix = apiKey.substring(0, 10) + '...'
-    try {
-      const response = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=${apiKey}`,
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            system_instruction: {
-              parts: [{ text: systemPrompt }],
+
+    // IMPORTANT: Gemini 3.x Flash models do NOT support disabling "thinking"
+    // entirely (only Pro-tier models can go full thinking-off). Reasoning
+    // tokens are deducted from the same maxOutputTokens budget as the visible
+    // response, so an unset thinkingConfig silently defaults to "medium"
+    // thinking and can eat most of the budget before the JSON is finished,
+    // producing truncated/invalid JSON on longer, denser transcripts.
+    // We use "low" (the smallest allowed) and, if we still get cut off
+    // (finishReason === "MAX_TOKENS"), retry once on the same key with a
+    // doubled budget before moving on.
+    let currentMaxTokens = Math.min(maxOutputTokens, MODEL_MAX_OUTPUT_TOKENS)
+    // Covers both kinds of retry this loop does: bumping the token budget
+    // after a MAX_TOKENS truncation, and backing off after a transient
+    // overload/rate-limit error.
+    const maxAttemptsPerKey = 5
+    let backoffMs = 1000 // 1s, 2s, 4s, 8s, capped at 8s
+
+    for (let attempt = 1; attempt <= maxAttemptsPerKey; attempt++) {
+      try {
+        const response = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=${apiKey}`,
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
             },
-            contents: [
-              {
-                role: "user",
-                parts: [{ text: prompt }],
+            body: JSON.stringify({
+              system_instruction: {
+                parts: [{ text: systemPrompt }],
               },
-            ],
-            generationConfig: {
-              temperature,
-              maxOutputTokens,
-              topP: 0.9,
-              topK: 40,
-              responseMimeType: "application/json",
-            },
-          }),
+              contents: [
+                {
+                  role: "user",
+                  parts: [{ text: prompt }],
+                },
+              ],
+              generationConfig: {
+                temperature,
+                maxOutputTokens: currentMaxTokens,
+                // NOTE: Gemini 3.x guidance recommends leaving topP/topK at
+                // their defaults — reasoning is tuned around them, and
+                // overriding them can itself increase malformed-output risk.
+                responseMimeType: "application/json",
+                thinkingConfig: { thinkingLevel: "low" },
+              },
+            }),
+          }
+        )
+
+        if (!response.ok) {
+          const errorText = await response.text()
+          const errMsg = `Key ${keyPrefix} (attempt ${attempt}): HTTP ${response.status} - ${errorText.substring(0, 200)}`
+          console.error(errMsg)
+          errors.push(errMsg)
+
+          if (RETRYABLE_STATUS_CODES.has(response.status) && attempt < maxAttemptsPerKey) {
+            console.warn(
+              `Key ${keyPrefix}: transient error (HTTP ${response.status}), retrying in ${backoffMs}ms...`
+            )
+            await sleep(backoffMs)
+            backoffMs = Math.min(backoffMs * 2, 8000)
+            continue // retry same key
+          }
+
+          break // non-retryable (or out of attempts) — move to next key
         }
-      )
 
-      if (!response.ok) {
-        const errorText = await response.text()
-        const errMsg = `Key ${keyPrefix}: HTTP ${response.status} - ${errorText.substring(0, 200)}`
-        console.error(errMsg)
+        const data = await response.json()
+        const candidate = data?.candidates?.[0]
+        const text = candidate?.content?.parts?.[0]?.text || ""
+        const finishReason = candidate?.finishReason as string | undefined
+
+        if (finishReason === "MAX_TOKENS") {
+          if (attempt < maxAttemptsPerKey && currentMaxTokens < MODEL_MAX_OUTPUT_TOKENS) {
+            const bumped = Math.min(currentMaxTokens * 2, MODEL_MAX_OUTPUT_TOKENS)
+            console.warn(
+              `Key ${keyPrefix}: hit MAX_TOKENS at budget ${currentMaxTokens}, retrying with ${bumped}`
+            )
+            currentMaxTokens = bumped
+            continue // retry same key with bigger budget
+          }
+          console.error(
+            `Key ${keyPrefix}: response truncated (MAX_TOKENS) even at ${currentMaxTokens} tokens`
+          )
+        }
+
+        return { text, finishReason, truncated: finishReason === "MAX_TOKENS" }
+      } catch (err) {
+        // Network-level failure (fetch threw) — also worth a backoff retry,
+        // it may just be a blip.
+        const errMsg = `Key ${keyPrefix} (attempt ${attempt}): ${String(err)}`
+        console.error("Gemini call error:", errMsg)
         errors.push(errMsg)
-        continue
+        if (attempt < maxAttemptsPerKey) {
+          await sleep(backoffMs)
+          backoffMs = Math.min(backoffMs * 2, 8000)
+          continue
+        }
+        break
       }
-
-      const data = await response.json()
-      const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || ""
-      return text
-    } catch (err) {
-      console.error("Gemini call error:", err)
-      continue
     }
   }
 
   throw new Error(`All ${GEMINI_API_KEYS.length} Gemini key(s) failed: ${errors.join(' | ')}`)
 }
 
+// Gemini's responseMimeType:"application/json" mostly produces valid JSON,
+// but on long multi-paragraph string fields it sometimes emits a literal
+// newline/tab/control character inside a string value instead of escaping
+// it (\n, \t, ...). Strict JSON.parse rejects raw control characters inside
+// string literals, which breaks parsing even though the response is
+// otherwise complete and well-formed. This walks the text and escapes any
+// raw control character it finds while inside a string, leaving everything
+// outside strings (formatting whitespace between tokens) untouched.
+function sanitizeControlCharactersInStrings(text: string): string {
+  let result = ''
+  let inString = false
+  let escape = false
+
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]
+
+    if (inString) {
+      if (escape) {
+        result += ch
+        escape = false
+        continue
+      }
+      if (ch === '\\') {
+        result += ch
+        escape = true
+        continue
+      }
+      if (ch === '"') {
+        inString = false
+        result += ch
+        continue
+      }
+      const code = text.charCodeAt(i)
+      if (code <= 0x1f) {
+        switch (ch) {
+          case '\n': result += '\\n'; break
+          case '\r': result += '\\r'; break
+          case '\t': result += '\\t'; break
+          case '\b': result += '\\b'; break
+          case '\f': result += '\\f'; break
+          default: result += '\\u' + code.toString(16).padStart(4, '0')
+        }
+        continue
+      }
+      result += ch
+      continue
+    }
+
+    if (ch === '"') {
+      inString = true
+    }
+    result += ch
+  }
+
+  return result
+}
+
+// Attempts to repair a truncated JSON string by closing any dangling
+// string/array/object so we can recover the (mostly complete) content
+// instead of discarding the whole response. Returns null if repair fails.
+function attemptJSONRepair(text: string): any | null {
+  const s = text.trim()
+  if (!s) return null
+
+  const stack: string[] = []
+  let inString = false
+  let escape = false
+
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i]
+    if (inString) {
+      if (escape) {
+        escape = false
+      } else if (ch === '\\') {
+        escape = true
+      } else if (ch === '"') {
+        inString = false
+      }
+      continue
+    }
+    if (ch === '"') {
+      inString = true
+      continue
+    }
+    if (ch === '{' || ch === '[') stack.push(ch)
+    else if (ch === '}' || ch === ']') stack.pop()
+  }
+
+  // Nothing open at all — not a truncation-shaped problem, repair won't help.
+  if (!inString && stack.length === 0) return null
+
+  let repaired = s
+
+  // Trim a dangling trailing comma / partial token right before we close things.
+  repaired = repaired.replace(/,\s*$/, '')
+
+  if (inString) {
+    repaired += '"'
+  }
+  for (let i = stack.length - 1; i >= 0; i--) {
+    repaired += stack[i] === '{' ? '}' : ']'
+  }
+
+  try {
+    return JSON.parse(repaired)
+  } catch {
+    try {
+      // One more pass: also strip trailing commas before closing brackets
+      // introduced by the repair itself.
+      const fixed = repaired.replace(/,\s*([\]}])/g, '$1')
+      return JSON.parse(fixed)
+    } catch {
+      return null
+    }
+  }
+}
+
+// Gemini sometimes emits a literal, unescaped `"` inside a string value —
+// e.g. quoting a term or figure for emphasis — instead of `\"`. That single
+// stray quote makes JSON.parse think the string ended early, and everything
+// after it looks like garbage (which also breaks the bracket-repair pass
+// below, since its brace/quote bookkeeping goes out of sync from that point
+// on). This walks the text and only treats a `"` encountered inside a string
+// as a real closing quote if it's actually followed by JSON syntax (`,`,
+// `}`, `]`, or `:`, ignoring whitespace) — otherwise it assumes it's an
+// internal quote and escapes it instead.
+function fixUnescapedQuotesInStrings(text: string): string {
+  let result = ''
+  let inString = false
+  let escape = false
+
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]
+
+    if (!inString) {
+      result += ch
+      if (ch === '"') inString = true
+      continue
+    }
+
+    if (escape) {
+      result += ch
+      escape = false
+      continue
+    }
+    if (ch === '\\') {
+      result += ch
+      escape = true
+      continue
+    }
+    if (ch === '"') {
+      let j = i + 1
+      while (j < text.length && /\s/.test(text[j])) j++
+      const next = text[j]
+      const looksLikeTerminator =
+        next === undefined || next === ',' || next === '}' || next === ']' || next === ':'
+      if (looksLikeTerminator) {
+        inString = false
+        result += ch
+      } else {
+        result += '\\"'
+      }
+      continue
+    }
+    result += ch
+  }
+
+  return result
+}
+
+function tryParse(candidate: string): any | null {
+  try {
+    return JSON.parse(candidate)
+  } catch {
+    return null
+  }
+}
+
+// Tries every combination of fixes against one candidate JSON-ish string,
+// from least to most invasive, returning the first that parses.
+function tryParseWithFixes(candidate: string): any | null {
+  let result = tryParse(candidate)
+  if (result) return result
+
+  const commaFixed = candidate.replace(/,\s*([\]}])/g, '$1')
+  result = tryParse(commaFixed)
+  if (result) return result
+
+  const quoteFixed = fixUnescapedQuotesInStrings(candidate)
+  result = tryParse(quoteFixed)
+  if (result) return result
+
+  const quoteAndCommaFixed = quoteFixed.replace(/,\s*([\]}])/g, '$1')
+  result = tryParse(quoteAndCommaFixed)
+  if (result) return result
+
+  // Last: attempt bracket/string repair on the quote-fixed text, since
+  // fixing stray quotes first is what makes the repair pass's open/closed
+  // bookkeeping trustworthy for genuinely truncated responses.
+  const repaired = attemptJSONRepair(quoteAndCommaFixed)
+  if (repaired) repaired.__wasRepaired = true
+  return repaired
+}
+
 // Helper: Parse JSON from Gemini response
-function parseGeminiJSON(text: string): any {
+function parseGeminiJSON(text: string, wasTruncated: boolean = false): any {
   if (!text || text.trim().length === 0) {
     throw new Error("Gemini returned empty response")
   }
 
-  const cleaned = text.trim()
+  // Fix raw control characters inside string literals first (see comment
+  // on sanitizeControlCharactersInStrings) — this alone resolves the most
+  // common real-world cause of "valid-looking but unparseable" responses.
+  const cleaned = sanitizeControlCharactersInStrings(text.trim())
 
-  // 1. Try direct parse first
-  try {
-    return JSON.parse(cleaned)
-  } catch { /* continue */ }
+  // 1. Try the full response as-is (with all fix combinations)
+  let result = tryParseWithFixes(cleaned)
+  if (result) return result
 
   // 2. Try code blocks: ```json ... ``` or ``` ... ```
   const codeBlockPatterns = [
@@ -111,38 +394,42 @@ function parseGeminiJSON(text: string): any {
   for (const pattern of codeBlockPatterns) {
     const match = cleaned.match(pattern)
     if (match) {
-      try {
-        return JSON.parse(match[1].trim())
-      } catch { /* continue */ }
+      result = tryParseWithFixes(match[1].trim())
+      if (result) return result
     }
   }
 
-  // 3. Find the outermost { ... } block (greedy)
+  // 3. Find the outermost { ... } block (greedy) and retry all fixes on it
   const outerMatch = cleaned.match(/\{[\s\S]*\}/)
   if (outerMatch) {
-    try {
-      return JSON.parse(outerMatch[0])
-    } catch {
-      // 4. Try fixing common JSON issues: trailing commas
-      let fixed = outerMatch[0]
-        .replace(/,\s*([\]}])/g, '$1')    // remove trailing commas before ] or }
-        .replace(/'/g, '"')                // single quotes → double quotes
-      try {
-        return JSON.parse(fixed)
-      } catch { /* continue */ }
-    }
+    result = tryParseWithFixes(outerMatch[0])
+    if (result) return result
   }
 
-  // 5. Try finding an array [ ... ]
+  // 4. Try finding an array [ ... ]
   const arrayMatch = cleaned.match(/\[[\s\S]*\]/)
   if (arrayMatch) {
-    try {
-      return JSON.parse(arrayMatch[0])
-    } catch { /* continue */ }
+    result = tryParseWithFixes(arrayMatch[0])
+    if (result) return result
   }
 
-  // 6. Last resort: wrap the text in a basic structure
-  console.error("Could not parse Gemini response as JSON. Raw text (first 500 chars):", cleaned.substring(0, 500))
+  // 5. Last-ditch repair directly on the raw cleaned text (covers cases
+  // where the outer-brace match itself was the problem, e.g. a stray `}`
+  // inside a string earlier confused the greedy match).
+  const repaired = attemptJSONRepair(fixUnescapedQuotesInStrings(cleaned))
+  if (repaired) {
+    console.warn(
+      `Recovered a ${wasTruncated ? "truncated" : "malformed"} Gemini response via JSON repair (some trailing content may be missing).`
+    )
+    repaired.__wasRepaired = true
+    return repaired
+  }
+
+  // 6. Truly last resort: wrap the text in a basic structure
+  console.error(
+    `Could not parse or repair Gemini response as JSON${wasTruncated ? " (response was truncated by MAX_TOKENS)" : ""}. Raw text (first 500 chars):`,
+    cleaned.substring(0, 500)
+  )
   return {
     summary: cleaned.substring(0, 500),
     summary_en: cleaned.substring(0, 500),
@@ -154,6 +441,7 @@ function parseGeminiJSON(text: string): any {
     glossary_en: [],
     todos: [],
     mindmap: { central: "Lecture", branches: [] },
+    __parseFailed: true,
   }
 }
 
@@ -189,19 +477,24 @@ serve(async (req: Request) => {
     // Estimate lecture duration
     const estimatedMinutes = Math.max(5, Math.round(fullTranscript.length / 150))
 
-    // Determine token budgets based on duration
-    let notesTokens = 4000
-    let studyTokens = 6000
+    // Determine token budgets based on duration.
+    // Bumped up from the previous values to leave headroom for Gemini 3.5
+    // Flash's mandatory "low" thinking overhead on top of the visible JSON,
+    // and capped at the model's real 65536-token ceiling.
+    let notesTokens = 6000
+    let studyTokens = 7000
     if (estimatedMinutes > 60) {
-      notesTokens = 32000
-      studyTokens = 9000
+      notesTokens = 40000
+      studyTokens = 12000
     } else if (estimatedMinutes > 45) {
-      notesTokens = 24000
-      studyTokens = 8000
+      notesTokens = 30000
+      studyTokens = 10000
     } else if (estimatedMinutes > 30) {
-      notesTokens = 16000
-      studyTokens = 7000
+      notesTokens = 20000
+      studyTokens = 9000
     }
+    notesTokens = Math.min(notesTokens, MODEL_MAX_OUTPUT_TOKENS)
+    studyTokens = Math.min(studyTokens, MODEL_MAX_OUTPUT_TOKENS)
 
     // System prompts
     const todayDate = new Date().toISOString().split('T')[0]
@@ -259,13 +552,13 @@ Respond in JSON format with this exact structure:
 }`
 
     // Generate notes and study materials in parallel
-    const [notesText, studyText] = await Promise.all([
+    const [notesResult, studyResult] = await Promise.all([
       callGeminiWithRotation(fullTranscript, notesSystemPrompt, notesTokens, 0.3),
       callGeminiWithRotation(fullTranscript, studySystemPrompt, studyTokens, 0.3),
     ])
 
-    const notesContent = parseGeminiJSON(notesText)
-    const quizContent = parseGeminiJSON(studyText)
+    const notesContent = parseGeminiJSON(notesResult.text, notesResult.truncated)
+    const quizContent = parseGeminiJSON(studyResult.text, studyResult.truncated)
 
     // Clean up session data
     await supabaseAdmin
@@ -285,6 +578,10 @@ Respond in JSON format with this exact structure:
         quizContent,
         estimatedMinutes,
         chunkCount,
+        // Surfaced so the client/logs can tell if content may be incomplete,
+        // even though we did our best to recover it above.
+        notesTruncated: notesResult.truncated || !!notesContent.__parseFailed,
+        quizTruncated: studyResult.truncated || !!quizContent.__parseFailed,
       }),
       {
         headers: { ...corsHeaders, "Content-Type": "application/json" },

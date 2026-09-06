@@ -5,10 +5,60 @@ interface PDFOptions {
   isUrdu?: boolean
 }
 
+const FONT_HREFS: Record<'en' | 'ur', string> = {
+  en: 'https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap',
+  ur: 'https://fonts.googleapis.com/css2?family=Noto+Nastaliq+Urdu:wght@400;700&display=swap',
+}
+
+const FONT_LOAD_SPECS: Record<'en' | 'ur', string[]> = {
+  en: ['400 16px "Inter"', '600 16px "Inter"', '700 16px "Inter"'],
+  ur: ['400 16px "Noto Nastaliq Urdu"', '700 16px "Noto Nastaliq Urdu"'],
+}
+
+/**
+ * FIX: the @import inside buildNotesHTML's <style> block only starts
+ * fetching the font once html2pdf.js has already injected that markup
+ * into its (usually hidden) render container — there's no guarantee the
+ * font finishes downloading before html2canvas snapshots it. For a font
+ * as large as Noto Nastaliq Urdu, in practice it very often doesn't, so
+ * the PDF gets baked with whatever fallback font was active at that
+ * instant — which has no Urdu shaping at all.
+ *
+ * This registers the font on the *real* document ahead of time via an
+ * actual <link>, then waits on the Font Loading API to confirm it's
+ * actually ready before we let html2canvas touch anything.
+ */
+async function ensureFontReady(lang: 'en' | 'ur'): Promise<void> {
+  const existing = document.querySelector(`link[data-pdf-font="${lang}"]`)
+
+  if (!existing) {
+    await new Promise<void>((resolve) => {
+      const link = document.createElement('link')
+      link.rel = 'stylesheet'
+      link.href = FONT_HREFS[lang]
+      link.dataset.pdfFont = lang
+      link.onload = () => resolve()
+      // Don't block PDF export forever if the font CDN is unreachable —
+      // fall back to whatever's available rather than hang.
+      link.onerror = () => resolve()
+      document.head.appendChild(link)
+    })
+  }
+
+  try {
+    await Promise.all(FONT_LOAD_SPECS[lang].map((spec) => document.fonts.load(spec)))
+    await document.fonts.ready
+  } catch (err) {
+    console.warn('Font preload before PDF export failed, proceeding with fallback font:', err)
+  }
+}
+
 /**
  * Generate a PDF from an HTML string with proper styling for EN/Urdu
  */
 export async function generatePDF(htmlContent: string, options: PDFOptions): Promise<void> {
+  await ensureFontReady(options.isUrdu ? 'ur' : 'en')
+
   const opt = {
     margin: [10, 10, 10, 10] as [number, number, number, number],
     filename: options.filename,
@@ -16,7 +66,14 @@ export async function generatePDF(htmlContent: string, options: PDFOptions): Pro
     html2canvas: {
       scale: 2,
       useCORS: true,
-      letterRendering: true,
+      // FIX: letterRendering forces html2canvas to draw the canvas one
+      // letter at a time instead of as continuous text runs. That's a
+      // reasonable trade-off for Latin letter-spacing, but Urdu (like
+      // Arabic) depends on letters visually joining to their neighbors —
+      // drawing them in isolation breaks that joining outright, which is
+      // a widely-reported html2canvas bug with Arabic-family scripts.
+      // Nothing in this template actually needs letter-spacing, so this
+      // was pure downside for Urdu output.
       scrollY: 0,
     },
     jsPDF: {
@@ -43,6 +100,10 @@ export function buildNotesHTML(data: {
   examples?: { topic: string; example: string; context?: string }[]
   glossary?: { term: string; definition: string }[]
   quiz?: { question: string; options: string[]; correctIndex: number; explanation?: string }[]
+  // FIX: was accepted by NoteViewer's caller but never declared here, so
+  // TypeScript rejected it outright (TS2353) — the data never had a
+  // chance to reach the renderer below.
+  shortQA?: { question: string; answer: string }[]
 }): string {
   const isUrdu = data.lang === 'ur'
 
@@ -83,6 +144,9 @@ export function buildNotesHTML(data: {
         .quiz-option { font-size: 13px; padding: 3px 0; color: #4b5563; }
         .quiz-correct { color: #059669; font-weight: 600; }
         .quiz-explanation { font-size: 12px; color: #d97706; margin-top: 4px; font-style: italic; }
+        .shortqa-item { margin: 10px 0; padding: 10px; border: 1px solid #e5e7eb; border-radius: 8px; text-align: ${align}; }
+        .shortqa-question { font-weight: 700; font-size: 14px; margin-bottom: 6px; color: #1a1a2e; }
+        .shortqa-answer { font-size: 13px; color: #374151; line-height: 1.6; }
         .section-divider { border: none; border-top: 1px solid #e5e7eb; margin: 20px 0; }
       </style>
 
@@ -94,10 +158,6 @@ export function buildNotesHTML(data: {
   `
 
   // Summary
-  // FIX: previously reused the "note-item" class with an inert
-  // `style="list-style:none"` override — that CSS property does nothing
-  // against the ::before-generated bullet, so the overview paragraph was
-  // getting an unwanted bullet dot. Use a dedicated class instead.
   if (data.summary) {
     html += `
       <div class="section-title">${isUrdu ? 'خلاصہ' : 'Overview'}</div>
@@ -159,6 +219,23 @@ export function buildNotesHTML(data: {
     })
   }
 
+  // Short Answer Q&A
+  // FIX: this whole block was missing — shortQA was generated by the
+  // backend and shown fine on the Quiz tab in-app, but the PDF builder
+  // never had a template for it at all, so it could never have appeared
+  // in an exported PDF no matter what data NoteViewer sent it.
+  if (data.shortQA?.length) {
+    html += `<hr class="section-divider"><div class="section-title">${isUrdu ? 'مختصر جوابات' : 'Short Answers'}</div>`
+    data.shortQA.forEach((qa, i) => {
+      html += `
+        <div class="shortqa-item">
+          <div class="shortqa-question">Q${i + 1}. ${qa.question}</div>
+          <div class="shortqa-answer">${qa.answer}</div>
+        </div>
+      `
+    })
+  }
+
   html += '</div>'
   return html
 }
@@ -168,9 +245,12 @@ export function buildNotesHTML(data: {
  *
  * NOTE: this function currently has no `lang`/`isUrdu` branch at all, so
  * an Urdu question paper would hit the exact same left-alignment problem
- * that buildNotesHTML had. If you generate Urdu paper PDFs, apply the
- * same `dir`/`align`/`direction` treatment here (paperType, section
- * headers, questions, options, answers) before shipping it.
+ * that buildNotesHTML had, plus the same html2canvas letterRendering /
+ * font-race issues that generatePDF above now fixes for whichever HTML
+ * string it's given — those fixes are shared, but the dir/align/font
+ * treatment inside this function's own markup (paperType, section
+ * headers, questions, options, answers) still needs to be added here
+ * before shipping Urdu paper PDFs.
  */
 export function buildPaperHTML(data: {
   subjectName: string
