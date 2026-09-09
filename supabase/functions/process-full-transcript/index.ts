@@ -4,6 +4,14 @@
  */
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts"
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.0"
+// jsonrepair is a purpose-built, well-tested library for exactly the class
+// of problem we keep hitting: malformed LLM JSON output (truncation,
+// missing commas/brackets, unescaped/special quotes, stray control
+// characters, and more) — see https://github.com/josdejong/jsonrepair.
+// It replaces most of the hand-rolled recovery heuristics below as the
+// primary repair strategy; those heuristics stay in as a backstop in the
+// rare case jsonrepair itself can't make sense of a response.
+import { jsonrepair } from "https://esm.sh/jsonrepair@3.15.0"
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL") || ""
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || ""
@@ -349,6 +357,22 @@ function tryParseWithFixes(candidate: string): any | null {
   let result = tryParse(candidate)
   if (result) return result
 
+  // jsonrepair first — it's purpose-built for this and handles far more
+  // patterns in one pass (missing commas/brackets/quotes, truncation,
+  // stray text, special quote characters, etc.) than the hand-rolled
+  // fixes below. Guarded in try/catch: it throws rather than returning
+  // null when it can't make sense of the input at all.
+  try {
+    const repairedByLib = jsonrepair(candidate)
+    result = tryParse(repairedByLib)
+    if (result) return result
+  } catch (err) {
+    console.warn("jsonrepair could not repair this response, falling back to manual heuristics:", String(err))
+  }
+
+  // Everything below is a backstop for the rare case jsonrepair itself
+  // fails or isn't reachable (e.g. esm.sh hiccup) — kept rather than
+  // removed, since it's cheap and has already proven useful on its own.
   const commaFixed = candidate.replace(/,\s*([\]}])/g, '$1')
   result = tryParse(commaFixed)
   if (result) return result
@@ -413,9 +437,15 @@ function parseGeminiJSON(text: string, wasTruncated: boolean = false): any {
     if (result) return result
   }
 
-  // 5. Last-ditch repair directly on the raw cleaned text (covers cases
-  // where the outer-brace match itself was the problem, e.g. a stray `}`
-  // inside a string earlier confused the greedy match).
+  // 5. Last-ditch: try jsonrepair directly on the raw cleaned text (covers
+  // cases where the outer-brace match itself was the problem, e.g. a
+  // stray `}` inside a string earlier confused the greedy match), then
+  // fall back to the manual bracket-repair heuristic.
+  try {
+    result = tryParse(jsonrepair(cleaned))
+    if (result) return result
+  } catch { /* fall through to manual repair below */ }
+
   const repaired = attemptJSONRepair(fixUnescapedQuotesInStrings(cleaned))
   if (repaired) {
     console.warn(
@@ -425,11 +455,21 @@ function parseGeminiJSON(text: string, wasTruncated: boolean = false): any {
     return repaired
   }
 
-  // 6. Truly last resort: wrap the text in a basic structure
+  // 6. Truly last resort: wrap the text in a basic structure.
+  // Logging much more than a 500-char snippet here on purpose — a short
+  // snippet only ever shows the *start* of the response, which is nearly
+  // always well-formed; the actual break is usually further in. Logging
+  // the length plus a large head and tail makes the next failure (if any)
+  // actually diagnosable in one round trip instead of needing another
+  // back-and-forth to see enough of the text.
+  const total = cleaned.length
   console.error(
-    `Could not parse or repair Gemini response as JSON${wasTruncated ? " (response was truncated by MAX_TOKENS)" : ""}. Raw text (first 500 chars):`,
-    cleaned.substring(0, 500)
+    `Could not parse or repair Gemini response as JSON${wasTruncated ? " (response was truncated by MAX_TOKENS)" : ""}. Length: ${total} chars.`
   )
+  console.error("Raw text (first 2000 chars):", cleaned.substring(0, 2000))
+  if (total > 2000) {
+    console.error("Raw text (last 1000 chars):", cleaned.substring(Math.max(0, total - 1000)))
+  }
   return {
     summary: cleaned.substring(0, 500),
     summary_en: cleaned.substring(0, 500),
@@ -482,16 +522,16 @@ serve(async (req: Request) => {
     // Flash's mandatory "low" thinking overhead on top of the visible JSON,
     // and capped at the model's real 65536-token ceiling.
     let notesTokens = 6000
-    let studyTokens = 7000
+    let studyTokens = 9000
     if (estimatedMinutes > 60) {
       notesTokens = 40000
-      studyTokens = 12000
+      studyTokens = 18000
     } else if (estimatedMinutes > 45) {
       notesTokens = 30000
-      studyTokens = 10000
+      studyTokens = 14000
     } else if (estimatedMinutes > 30) {
       notesTokens = 20000
-      studyTokens = 9000
+      studyTokens = 12000
     }
     notesTokens = Math.min(notesTokens, MODEL_MAX_OUTPUT_TOKENS)
     studyTokens = Math.min(studyTokens, MODEL_MAX_OUTPUT_TOKENS)
@@ -535,19 +575,26 @@ Respond in JSON format with this exact structure:
   }
 }`
 
-    const studySystemPrompt = `You are an expert quiz creator for Pakistani universities.
+    const studySystemPrompt = `You are an expert university exam-paper setter for Pakistani university courses (BS/undergraduate level).
 Today's date is: ${todayDate}
-Based on the lecture transcript provided, generate:
-1. A 10-question multiple-choice quiz (bilingual)
-2. Short answer Q&A pairs (bilingual)
-3. To-do items for students with ABSOLUTE deadlines in YYYY-MM-DD format. If the teacher says "tomorrow" calculate from today (${todayDate}), "next week" = +7 days, "after 5 days" = +5 days.
+
+Based on the lecture transcript provided, generate EXAM-REALISTIC study material — the kind of questions that could genuinely appear in a real university midterm or final on this topic, not simple recall trivia.
+
+CRITICAL REQUIREMENTS FOR DIFFICULTY AND REALISM:
+1. Do not just ask "what is X" definition questions. Prefer questions that make the student apply a concept to a scenario, differentiate between two related concepts covered in the lecture, explain WHY something is true, or interpret/extend an example the teacher gave.
+2. For every MCQ, the 3 incorrect options must be PLAUSIBLE, exam-quality distractors: common misconceptions, closely related terms, or near-miss answers a student who only half-understood the lecture might pick. Do not use obviously silly or unrelated wrong options — a good MCQ should require real understanding to answer confidently.
+3. Short-answer questions should be phrased the way an actual exam paper would phrase them (e.g. "Differentiate between X and Y", "Explain why...", "What would happen if...", "Justify your answer with an example from the lecture") rather than one-line "what is" questions.
+4. Spread the difficulty: roughly a third straightforward concept-check, a third application-level, and a third comparison/analysis-level — so this can double as genuine exam prep.
+5. Every question, correct answer, and explanation must be strictly grounded in what was actually said in the transcript. Do not introduce outside facts, formulas, or examples not covered in the lecture, even if they are academically true elsewhere — students will be examined on this specific lecture's content.
+6. Explanations should say not just why the correct option is right, but briefly why the main distractor(s) are tempting-but-wrong, the way a good answer key does.
+7. To-do items for students with ABSOLUTE deadlines in YYYY-MM-DD format. If the teacher says "tomorrow" calculate from today (${todayDate}), "next week" = +7 days, "after 5 days" = +5 days.
 
 Respond in JSON format with this exact structure:
 {
-  "quiz": [{"question": "Urdu question", "options": ["A", "B", "C", "D"], "correctIndex": 0, "explanation": "Urdu explanation"}],
-  "quiz_en": [{"question": "English question", "options": ["A", "B", "C", "D"], "correctIndex": 0, "explanation": "English explanation"}],
-  "shortQA": [{"question": "Urdu question", "answer": "Urdu answer"}],
-  "shortQA_en": [{"question": "English question", "answer": "English answer"}],
+  "quiz": [{"question": "Urdu exam-style question", "options": ["A", "B", "C", "D"], "correctIndex": 0, "explanation": "Urdu explanation covering why the answer is correct and why the closest distractor is wrong"}],
+  "quiz_en": [{"question": "English exam-style question", "options": ["A", "B", "C", "D"], "correctIndex": 0, "explanation": "English explanation covering why the answer is correct and why the closest distractor is wrong"}],
+  "shortQA": [{"question": "Urdu exam-style question (differentiate/explain/justify style)", "answer": "Urdu answer written at the length and depth expected in a real exam response"}],
+  "shortQA_en": [{"question": "English exam-style question (differentiate/explain/justify style)", "answer": "English answer written at the length and depth expected in a real exam response"}],
   "todos": [{"task": "task", "deadline": "YYYY-MM-DD", "type": "assignment/quiz/reading/custom"}]
 }`
 
